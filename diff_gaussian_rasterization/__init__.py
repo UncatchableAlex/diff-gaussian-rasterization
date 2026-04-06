@@ -11,12 +11,21 @@
 
 from typing import NamedTuple
 import torch.nn as nn
+import numpy as np
 import torch
 from . import _C
+import json
+from futhark_server import Server
 
 def cpu_deep_copy_tuple(input_tuple):
     copied_tensors = [item.cpu().clone() if isinstance(item, torch.Tensor) else item for item in input_tuple]
     return tuple(copied_tensors)
+
+
+def to_numpy(v):
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu().numpy().astype(np.float32)
+    return np.array(v).astype(np.float32)
 
 def rasterize_gaussians(
     means3D,
@@ -79,8 +88,82 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.antialiasing,
             raster_settings.debug
         )
+        # # --- Step 1: Save tensors ---
+        # np.save('debug_means3D.npy', means3D.cpu().numpy())
+        # np.save('debug_sh.npy', sh.cpu().numpy())
+        # np.save('debug_colors_precomp.npy', colors_precomp.cpu().numpy())
+        # np.save('debug_opacities.npy', opacities.cpu().numpy())
+        # np.save('debug_scales.npy', scales.cpu().numpy())
+        # np.save('debug_rotations.npy', rotations.cpu().numpy())
+        # np.save('debug_cov3Ds_precomp.npy', cov3Ds_precomp.cpu().numpy())
 
+        # # --- Step 2: Save scalar settings separately ---
+        # scalar_settings = {
+        #     'bg': raster_settings.bg.tolist(),
+        #     'scale_modifier': raster_settings.scale_modifier,
+        #     'viewmatrix': raster_settings.viewmatrix.tolist(),
+        #     'projmatrix': raster_settings.projmatrix.tolist(),
+        #     'tanfovx': raster_settings.tanfovx,
+        #     'tanfovy': raster_settings.tanfovy,
+        #     'image_height': raster_settings.image_height,
+        #     'image_width': raster_settings.image_width,
+        #     'sh_degree': raster_settings.sh_degree,
+        #     'campos': raster_settings.campos.tolist(),
+        #     'prefiltered': raster_settings.prefiltered,
+        #     'antialiasing': raster_settings.antialiasing,
+        #     'debug': raster_settings.debug
+        # }
+        # #print(f"Saving scalar settings: {scalar_settings}")
+        # with open('debug_rasterizer_settings.json', 'w') as f:
+        #     json.dump(scalar_settings, f)
         # Invoke C++/CUDA rasterizer
+
+        # if we are supposed to use the futhark implementation of the renderer,
+        # then pass our params to the futhark server through stdin. It's kind of a
+        # bummer that we have to detach our tensors from the gpu to feed them to 
+        # the server via stdin where they just get written to the gpu again. We basically
+        # go gpu -> cpu -> gpu. Kinda sus
+        if raster_settings.futhark_server:
+            server = raster_settings.futhark_server
+            inputs = {
+                'bg':           to_numpy(raster_settings.bg),
+                'means3D':      to_numpy(means3D),
+                'colors':       to_numpy(colors_precomp),
+                'opacities':    to_numpy(opacities),
+                'scales':       to_numpy(scales),
+                'rotations':    to_numpy(rotations),
+                'viewmatrix':   to_numpy(raster_settings.viewmatrix).T,
+                'projmatrix':   to_numpy(raster_settings.projmatrix).T,
+                'tanfovx':      np.float32(raster_settings.tanfovx),
+                'tanfovy':      np.float32(raster_settings.tanfovy),
+                'image_height': np.int64(raster_settings.image_height),
+                'image_width':  np.int64(raster_settings.image_width),
+            }
+            # provide all inputs to the server
+            for name, value in inputs.items():
+                server.put_value(name, value)
+
+            # rasterize with the futhark server
+            server.cmd_call(
+                "rasterize",
+                'radii',
+                'color',                   
+                *inputs.keys())
+            radii = server.get_value('radii')
+            color = np.transpose(server.get_value('color'), (2, 0, 1))
+
+            # free variables from the server (we will replace them with new values next time we call the rasterizer)
+            for name in inputs.keys():
+                server.cmd_free(name)
+
+            print(radii.shape, color.shape)
+
+            invdepths = np.array([])
+            return (torch.tensor(color, device='cuda', dtype=torch.float32), 
+                    torch.tensor(radii, device='cuda', dtype=torch.int32), 
+                    invdepths)
+
+
         num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths = _C.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward
@@ -154,6 +237,7 @@ class GaussianRasterizationSettings(NamedTuple):
     prefiltered : bool
     debug : bool
     antialiasing : bool
+    futhark_server : Server
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
